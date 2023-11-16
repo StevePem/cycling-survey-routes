@@ -63,6 +63,17 @@ cyclable.links <- links %>%
 cyclable.nodes <- nodes %>%
   filter(id %in% cyclable.links$from_id | id %in% cyclable.links$to_id)
 
+# nodes for from and to links
+cyclable.from.nodes <- nodes %>%
+  filter(id %in% cyclable.links$from_id)
+
+cyclable.to.nodes <- nodes %>%
+  filter(id %in% cyclable.links$to_id)
+
+cyclable.both.nodes <- nodes %>%
+  filter(id %in% cyclable.links$from_id & id %in% cyclable.links$to_id)
+  
+
 # get the crs of the network (so routes can be in same crs)
 networkCrs <- st_crs(links)
 
@@ -147,7 +158,18 @@ routes_networked <-
               st_as_sf(coords = c("X", "Y"), crs = networkCrs)
             
             # find nearest node to each vertex
-            nearest_nodes <- cyclable.nodes$id[st_nearest_feature(vertices, cyclable.nodes)]
+            nearest_nodes_start <- 
+              cyclable.from.nodes$id[st_nearest_feature(vertices[1,], cyclable.from.nodes)]
+            if(nrow(vertices) > 2) {
+              second_last = nrow(vertices) - 1
+              nearest_nodes_mid <- 
+                cyclable.both.nodes$id[st_nearest_feature(vertices[2:second_last, ], cyclable.both.nodes)]
+            } else {
+              nearest_nodes_mid <- c()
+            }
+            nearest_nodes_end <- 
+              cyclable.to.nodes$id[st_nearest_feature(vertices[nrow(vertices),], cyclable.to.nodes)]
+            nearest_nodes <- c(nearest_nodes_start, nearest_nodes_mid, nearest_nodes_end)
             vertices <- cbind(vertices, nearest_nodes)
             
             # eliminate any sections that return to a pre-used node
