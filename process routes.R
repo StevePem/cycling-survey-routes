@@ -274,10 +274,67 @@ close(pb)
 stopCluster(cluster)
 
 # save output
-st_write(routes_networked, "./data/routes_networked.sqlite", delete_dsn = TRUE)
+st_write(routes_networked, "./data/routes_networked.sqlite", 
+         layer = "survey", delete_layer = TRUE)
 
 
-# 4 Output maps  ----
+# 4 Output paths  ----
+# -----------------------------------------------------------------------------#
+# reload routes (note code below assumes re-loading sqlite has converted column names to lower case)
+routes_networked <- st_read("./data/routes_networked.sqlite")
+
+# empty sf objects
+routes_networked_paths <- st_sf(geometry = st_sfc(), 
+                                data.frame(id = numeric(), 
+                                           stringsAsFactors = FALSE),
+                                crs = st_crs(links))
+
+routes_networked_startpoints <- st_sf(geometry = st_sfc(), 
+                                      data.frame(id = numeric(), 
+                                                 stringsAsFactors = FALSE),
+                                      crs = st_crs(links))
+
+# create line and start point for each route
+for (i in 1:nrow(routes_networked)) {
+  link.ids <- routes_networked$network_edges[i] %>%
+    strsplit(., ", ") %>%
+    unlist() %>%
+    as.numeric()
+  
+  link.startnode <- routes_networked$network_nodes[i] %>%
+    strsplit(., ", ") %>%
+    unlist() %>%
+    .[1] %>%
+    as.numeric()
+  
+  route_links <- links %>% 
+    filter(link_id %in% link.ids) %>%
+    st_union()
+  
+  route_start <- nodes %>%
+    filter(id == link.startnode) %>%
+    mutate(id = i) %>%
+    dplyr::select(id)
+  
+  if (length(route_links) > 0) {
+    routes_networked_paths <- bind_rows(routes_networked_paths, 
+                                        st_sf(geometry = st_sfc(route_links), 
+                                              id = i))
+    
+    routes_networked_startpoints <- rbind(routes_networked_startpoints,
+                                              route_start)
+  } 
+}
+
+# write output
+st_write(routes_networked_paths, "./data/routes_networked.sqlite", 
+         layer = "networked", delete_layer = TRUE)
+st_write(routes_networked_startpoints, "./data/routes_networked.sqlite",
+         layer = "startpoints", delete_layer = TRUE)
+
+
+
+# 5 Output maps  ----
 # -----------------------------------------------------------------------------#
 # create folder for maps if doesn't exist
 if (!dir.exists(outputMapDir)) {
