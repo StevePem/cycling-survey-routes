@@ -20,10 +20,10 @@
 
 
 # set inputs
-networkFile <- "./data/network_melbourne.sqlite"  # new simplified network (note - all one way)
+networkFile <- "./data/network_melbourne_survey.sqlite"  # simplified network (note - all one way)
 linkLayer <- "links"
 nodeLayer <- "nodes"
-surveyFile <- "./data/Routes_to_work.csv"
+surveyFile <- "./data/routedata.csv"
 outputMapDir <- "./data/output maps"
 
 # parameters
@@ -89,34 +89,34 @@ graph <- graph_from_data_frame(cyclable.links %>%
 # load survey paths
 routes <- read.csv(surveyFile)
 
-# convert the route column to wkt
-for (i in 1:nrow(routes)) {
-  string <- routes$Route_to_work[i]
-  
-  # remove square brackets and double quotes, keep numbers and commas
-  # (note that the outer square brackets define a character class, containing
-  # the escaped elements ", [ and ]; the [ and ] require double escape)
-  cleaned_string <-  str_replace_all(string, "[\"\\[\\]]", "") 
-  
-  # split the string into a vector of numbers
-  coords <- as.numeric(strsplit(cleaned_string, ",")[[1]])
-  
-  # create a matrix with two columns for lat and long (reversing order)
-  coords_matrix <- matrix(coords, ncol = 2, byrow = TRUE)[, c(2, 1)]
-  
-  # create an sf object with a linestring geometry
-  linestring <- st_linestring(coords_matrix)
-  
-  # convert the linestring to WKT format
-  wkt_linestring <- st_as_text(linestring)
-  
-  # add a geom column containing wkt geometry
-  routes$geom[i] <- wkt_linestring
-
-}
+# convert the route column to wkt (not needed where it's already wkt)
+# for (i in 1:nrow(routes)) {
+#   string <- routes$Route_to_work[i]
+#   
+#   # remove square brackets and double quotes, keep numbers and commas
+#   # (note that the outer square brackets define a character class, containing
+#   # the escaped elements ", [ and ]; the [ and ] require double escape)
+#   cleaned_string <-  str_replace_all(string, "[\"\\[\\]]", "") 
+#   
+#   # split the string into a vector of numbers
+#   coords <- as.numeric(strsplit(cleaned_string, ",")[[1]])
+#   
+#   # create a matrix with two columns for lat and long (reversing order)
+#   coords_matrix <- matrix(coords, ncol = 2, byrow = TRUE)[, c(2, 1)]
+#   
+#   # create an sf object with a linestring geometry
+#   linestring <- st_linestring(coords_matrix)
+#   
+#   # convert the linestring to WKT format
+#   wkt_linestring <- st_as_text(linestring)
+#   
+#   # add a geom column containing wkt geometry
+#   routes$WKT[i] <- wkt_linestring
+# 
+# }
 
 # convert to an sf object in the correct CRS
-routes_sf <- st_as_sf(routes, wkt = "geom", crs = 4326) %>%
+routes_sf <- st_as_sf(routes, wkt = "WKT", crs = 4326) %>%
   st_transform(networkCrs)
 
 
@@ -362,8 +362,8 @@ output <-
             # selected route
             route <- routes_networked[i,]
             
-            map.title <- paste0("Map no ", i, ",  Repondent_ID ", route$respondent_id)
-            map.filename <- paste0("map_", i, "_resp_id_", routes$respondent_id)
+            map.title <- paste0("Map no ", i, ",  routeID ", route$routeID)
+            map.filename <- paste0("map_", i, "_routeID_", route$routeID)
             
             # surrounding roads
             route_bbox <- st_bbox(route) %>%
