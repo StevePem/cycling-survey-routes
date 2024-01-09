@@ -122,6 +122,33 @@ routes_sf <- st_as_sf(routes, wkt = "geom", crs = 4326) %>%
 
 # 3 Find routes  ----
 # -----------------------------------------------------------------------------#
+# function for eliminating loops/backtracks: returns any section where there
+# is a return to a pre-used node
+removeLoops <- function(selected.nodes) {
+  idx_to_omit <- c()
+  for (j in 2:length(selected.nodes)) {
+    previous_nodes = selected.nodes[1:j-1]
+    if (length(idx_to_omit) > 0) {
+      retained_previous_nodes <- previous_nodes[-idx_to_omit]
+    } else {
+      retained_previous_nodes <- previous_nodes
+    }
+    if (selected.nodes[j] %in% retained_previous_nodes) {
+      # find the first instance of the node that is repeated, and the node before its repeat
+      first_match_idx = match(selected.nodes[j], previous_nodes)
+      j_minus_1_idx = j-1
+      # add sequence from first_match_idx to j-1 to the indices to omit, but only
+      # if not previously omitted
+      if (!first_match_idx %in% idx_to_omit & !j_minus_1_idx %in% idx_to_omit) {
+        idx_to_omit <- c(idx_to_omit, first_match_idx:j_minus_1_idx)
+      }
+    }
+  }
+  
+  return(idx_to_omit)
+  
+}
+
 # table to hold outputs
 routes_networked_base <- routes_sf %>%
   mutate(network_nodes = "",
@@ -174,25 +201,7 @@ routes_networked <-
             
             # eliminate any sections that return to a pre-used node
             # identify the indices of the relevant nodes
-            idx_to_omit <- c()
-            for (j in 2:length(nearest_nodes)) {
-              previous_nodes = nearest_nodes[1:j-1]
-              if (length(idx_to_omit) > 0) {
-                retained_previous_nodes <- previous_nodes[-idx_to_omit]
-              } else {
-                retained_previous_nodes <- previous_nodes
-              }
-              if (nearest_nodes[j] %in% retained_previous_nodes) {
-                # find the first instance of the node that is repeated, and the node before its repeat
-                first_match_idx = match(nearest_nodes[j], previous_nodes)
-                j_minus_1_idx = j-1
-                # add sequence from first_match_idx to j-1 to the indices to omit, but only
-                # if not previously omitted
-                if (!first_match_idx %in% idx_to_omit & !j_minus_1_idx %in% idx_to_omit) {
-                  idx_to_omit <- c(idx_to_omit, first_match_idx:j_minus_1_idx)
-                }
-              }
-            }
+            idx_to_omit <- removeLoops(nearest_nodes)
             
             # omit the vertices corresponding to the indices to be omitted, if any
             if (length(idx_to_omit > 0)) {
@@ -232,30 +241,14 @@ routes_networked <-
               }
               
               # do another round of eliminating any sections that return to a pre-used node
-              idx_to_omit <- c()
-              for (j in 2:length(node_list)) {
-                previous_nodes = node_list[1:j-1]
-                if (length(idx_to_omit) > 0) {
-                  retained_previous_nodes <- previous_nodes[-idx_to_omit]
-                } else {
-                  retained_previous_nodes <- previous_nodes
-                }
-                if (node_list[j] %in% retained_previous_nodes) {
-                  # find the first instance of the node that is repeated, and the node before its repeat
-                  first_match_idx = match(node_list[j], previous_nodes)
-                  j_minus_1_idx = j-1
-                  # add sequence from first_match_idx to j-1 to the indices to omit, but only
-                  # if not previously omitted
-                  if (!first_match_idx %in% idx_to_omit & !j_minus_1_idx %in% idx_to_omit) {
-                    idx_to_omit <- c(idx_to_omit, first_match_idx:j_minus_1_idx)
-                  }
-                }
-              }
-              
-              # omit the nodes and edges corresponding to the indices to be omitted, if any
-              if (length(idx_to_omit > 0)) {
+              idx_to_omit <- removeLoops(node_list)
+
+              # if there are indices to be omitted, then omit the nodes and edges;
+              # and test again for any further repetitions
+              while (length(idx_to_omit > 0)) {
                 node_list <- node_list[-idx_to_omit]
                 edge_list <- edge_list[-idx_to_omit]
+                idx_to_omit <- removeLoops(node_list)
               }
               
               # write to output row
@@ -369,8 +362,8 @@ output <-
             # selected route
             route <- routes_networked[i,]
             
-            map.title <- paste0("Map no ", i, ",  Repondent_ID ", routes_networked$respondent_id[i])
-            map.filename <- paste0("map_", i, "_resp_id_", routes_networked$respondent_id[i])
+            map.title <- paste0("Map no ", i, ",  Repondent_ID ", route$respondent_id)
+            map.filename <- paste0("map_", i, "_resp_id_", routes$respondent_id)
             
             # surrounding roads
             route_bbox <- st_bbox(route) %>%
@@ -394,7 +387,7 @@ output <-
             
             if (nrow(networked_route) > 0) {
               # starting point
-              starting_node <- routes_networked$network_nodes[i][1] %>%
+              starting_node <- route$network_nodes[1] %>%
                 str_split(., ", ") %>%
                 unlist() %>%
                 .[1] %>%
