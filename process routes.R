@@ -8,8 +8,10 @@
 #   •	Note that network is assumed to be one where all links are one way
 # 2 Convert route strings in survey results to WKT, and then to an sf object
 # 3 Extract the vertices of each string as points, and find the nearest node to each point
-# 4 Eliminate any sections that return to a pre-used node as backtracking or a loop
-# 5 For each segment between a pair of points, find the shortest route, and \
+# 4 Eliminate any sections that return to a pre-used node as backtracking or a loop,
+#   except where start and end nodes are the same, or where manual inspection
+#   shows what looks like an obvious deliberate loop
+# 5 For each segment between a pair of points, find the shortest route, and 
 #   extract its nodes (vpath) and edges (epath)
 #   •	Note that this finds a directed route (cyclists cannot ride the wrong way, 
 #     or on a footpath, which some may in fact do)
@@ -17,6 +19,7 @@
 #   node as backtracking or a loop
 # 7 Write output
 # 8 Produce check maps showing the survey and networked routes
+# 9 Find routes that pass through 'stressful junctions'
 
 
 # set inputs
@@ -25,9 +28,8 @@ linkLayer <- "links"
 nodeLayer <- "nodes"
 surveyFile <- "./data/routedata.csv"
 outputMapDir <- "./data/output maps"
-
-# parameters
-bufferDistance <- 100  # distance to buffer paths, creating constrained network to search for matching link
+stressJctFile <- "./data/StressJct.csv"
+favSpotFile <- "./data/FavSpot.csv"
 
 
 # set up environment
@@ -42,9 +44,9 @@ library(parallel)
 library(foreach)
 # library(lwgeom)
 # library(nngeo)  # for nn (nearest) - not used where k=1, use st_nearest_feature
-# library(fs)  # for dir_walk
+library(fs)  # for dir_walk
 
-# dir_walk(path="./functions/",source, recurse=T, type = "file")
+dir_walk(path="./functions/",source, recurse=T, type = "file")
 
 
 # 1 Load and process network ----
@@ -55,13 +57,19 @@ nodes <- st_read(networkFile, layer = nodeLayer)
 
 # exclude all links that are motorways, unless they are specifically tagged as
 # cyclable or walkable
-cyclable.links <- links %>%
+all.cyclable.links <- links %>%
   filter(!highway %in% c("motorway", "motorway_link") | 
            (highway %in% c("motorway", "motorway_link") & 
               (str_detect(modes, "walk") | str_detect(modes, "bike"))))
 
-cyclable.nodes <- nodes %>%
-  filter(id %in% cyclable.links$from_id | id %in% cyclable.links$to_id)
+all.cyclable.nodes <- nodes %>%
+  filter(id %in% all.cyclable.links$from_id | id %in% all.cyclable.links$to_id)
+
+# keep largest connected network
+largest.component <- largestConnectedComponent(all.cyclable.nodes, all.cyclable.links)
+cyclable.nodes <- largest.component[[1]]
+cyclable.links <- largest.component[[2]]
+
 
 # nodes for from and to links
 cyclable.from.nodes <- nodes %>%
@@ -123,26 +131,38 @@ routes_sf <- st_as_sf(routes, wkt = "WKT", crs = 4326) %>%
 # 3 Find routes  ----
 # -----------------------------------------------------------------------------#
 # function for eliminating loops/backtracks: returns any section where there
-# is a return to a pre-used node
-removeLoops <- function(selected.nodes) {
+# is a return to a pre-used node, unless entire route is a loop
+removeLoops <- function(selected.nodes, route) {
   idx_to_omit <- c()
-  for (j in 2:length(selected.nodes)) {
-    previous_nodes = selected.nodes[1:j-1]
-    if (length(idx_to_omit) > 0) {
-      retained_previous_nodes <- previous_nodes[-idx_to_omit]
-    } else {
-      retained_previous_nodes <- previous_nodes
-    }
-    if (selected.nodes[j] %in% retained_previous_nodes) {
-      # find the first instance of the node that is repeated, and the node before its repeat
-      first_match_idx = match(selected.nodes[j], previous_nodes)
-      j_minus_1_idx = j-1
-      # add sequence from first_match_idx to j-1 to the indices to omit, but only
-      # if not previously omitted
-      if (!first_match_idx %in% idx_to_omit & !j_minus_1_idx %in% idx_to_omit) {
-        idx_to_omit <- c(idx_to_omit, first_match_idx:j_minus_1_idx)
+  
+  # don't eliminate if start and end nodes are the same, or other where manual
+  # checking revealed a large loop component
+  if (!(selected.nodes[1] == selected.nodes[length(selected.nodes)] &
+        length(selected.nodes > 2)) &
+      # manual (maps 353, 376, 542, 554, 517, 66)
+      !(route$routeID %in% c("7bep8cwz3fb6_2", "7l9g4utj97r6_1",
+                             "9vl86ffx3ue4_1", "9yr2zbt7i4s6_1",
+                             "9pt99buo346p_1", "2t66ibj3wkt8_1"))) {
+    
+    for (j in 2:length(selected.nodes)) {
+      previous_nodes = selected.nodes[1:j-1]
+      if (length(idx_to_omit) > 0) {
+        retained_previous_nodes <- previous_nodes[-idx_to_omit]
+      } else {
+        retained_previous_nodes <- previous_nodes
+      }
+      if (selected.nodes[j] %in% retained_previous_nodes) {
+        # find the first instance of the node that is repeated, and the node before its repeat
+        first_match_idx = match(selected.nodes[j], previous_nodes)
+        j_minus_1_idx = j-1
+        # add sequence from first_match_idx to j-1 to the indices to omit, but only
+        # if not previously omitted
+        if (!first_match_idx %in% idx_to_omit & !j_minus_1_idx %in% idx_to_omit) {
+          idx_to_omit <- c(idx_to_omit, first_match_idx:j_minus_1_idx)
+        }
       }
     }
+    
   }
   
   return(idx_to_omit)
@@ -201,7 +221,7 @@ routes_networked <-
             
             # eliminate any sections that return to a pre-used node
             # identify the indices of the relevant nodes
-            idx_to_omit <- removeLoops(nearest_nodes)
+            idx_to_omit <- removeLoops(nearest_nodes, route)
             
             # omit the vertices corresponding to the indices to be omitted, if any
             if (length(idx_to_omit > 0)) {
@@ -218,7 +238,7 @@ routes_networked <-
               for (j in 2:nrow(vertices)) {
                 from_node <- vertices$nearest_nodes[j-1]
                 to_node <- vertices$nearest_nodes[j]
-                path <- shortest_paths(graph, 
+                path <- shortest_paths(graph,
                                        from = as.character(from_node),
                                        to = as.character(to_node),
                                        mode = "out",
@@ -227,28 +247,28 @@ routes_networked <-
                 # nodes and edges in the shortest route
                 if (j == 2) {
                   # first section: all nodes
-                  nodes <- cyclable.nodes$id[as.numeric(path$vpath[[1]])]
+                  shortest.nodes <- cyclable.nodes$id[as.numeric(path$vpath[[1]])]
                 } else {
                   # numbers of the nodes, except the first (which was last of the preceding segment)
-                  nodes <- cyclable.nodes$id[as.numeric(path$vpath[[1]])[-1]]
+                  shortest.nodes <- cyclable.nodes$id[as.numeric(path$vpath[[1]])[-1]]
                 }
                 
-                edges <- edge_attr(graph, "link_id", path$epath[[1]])
+                shortest.edges <- edge_attr(graph, "link_id", path$epath[[1]])
                 
                 # add to the node and edge lists
-                node_list <- c(node_list, nodes)
-                edge_list <- c(edge_list, edges)
+                node_list <- c(node_list, shortest.nodes)
+                edge_list <- c(edge_list, shortest.edges)
               }
               
               # do another round of eliminating any sections that return to a pre-used node
-              idx_to_omit <- removeLoops(node_list)
+              idx_to_omit <- removeLoops(node_list, route)
 
               # if there are indices to be omitted, then omit the nodes and edges;
               # and test again for any further repetitions
               while (length(idx_to_omit > 0)) {
                 node_list <- node_list[-idx_to_omit]
                 edge_list <- edge_list[-idx_to_omit]
-                idx_to_omit <- removeLoops(node_list)
+                idx_to_omit <- removeLoops(node_list, route)
               }
               
               # write to output row
@@ -256,6 +276,18 @@ routes_networked <-
               route$network_edges <- toString(edge_list)
               
             }
+            
+            # ggplot() +
+            #   geom_sf(data = links %>%
+            #                     filter(link_id %in% (route$network_edges  %>%
+            #                              strsplit(., ", ") %>%
+            #                              unlist() %>%
+            #                              as.numeric())),
+            #                   colour = "blue") +
+            #   geom_sf(data = vertices, colour = "red")
+
+            # ggplot() +
+            #   geom_sf(data = links[shortest.edges,])
             
             # return output row
             return(route)
@@ -274,7 +306,7 @@ st_write(routes_networked, "./data/routes_networked.sqlite",
 # 4 Output paths  ----
 # -----------------------------------------------------------------------------#
 # reload routes (note code below assumes re-loading sqlite has converted column names to lower case)
-routes_networked <- st_read("./data/routes_networked.sqlite")
+routes_networked <- st_read("./data/routes_networked.sqlite", layer = "survey")
 
 # empty sf objects
 routes_networked_paths <- st_sf(geometry = st_sfc(), 
@@ -335,7 +367,7 @@ if (!dir.exists(outputMapDir)) {
 }
 
 # reload routes (note code below assumes re-loading sqlite has converted column names to lower case)
-routes_networked <- st_read("./data/routes_networked.sqlite")
+routes_networked <- st_read("./data/routes_networked.sqlite", layer = "survey")
 
 # setup for parallel processing - detect available cores and create cluster
 cores <- detectCores()
@@ -348,13 +380,13 @@ print(paste(Sys.time(), "| Printing maps for", nrow(routes_networked),
 
 # set up progress reporting
 # https://stackoverflow.com/questions/5423760/how-do-you-create-a-progress-bar-when-using-the-foreach-function-in-r
-pb <- txtProgressBar(max = nrow(routes_networked_base), style = 3)
+pb <- txtProgressBar(max = nrow(routes_networked), style = 3)
 progress <- function(n) setTxtProgressBar(pb, n)
 opts <- list(progress = progress)
 
 # create and save map for each route 
 output <- 
-  foreach(i = 1:nrow(routes_networked_base),
+  foreach(i = 1:nrow(routes_networked),
           # foreach(i = 1:8,
           .packages = c("dplyr", "sf", "stringr", "ggplot2", "ggspatial"),
           .options.snow = opts) %dopar% {
@@ -362,8 +394,8 @@ output <-
             # selected route
             route <- routes_networked[i,]
             
-            map.title <- paste0("Map no ", i, ",  routeID ", route$routeID)
-            map.filename <- paste0("map_", i, "_routeID_", route$routeID)
+            map.title <- paste0("Map no ", i, ",  routeID ", route$routeid)
+            map.filename <- paste0("map_", i, "_routeID_", route$routeid)
             
             # surrounding roads
             route_bbox <- st_bbox(route) %>%
@@ -450,4 +482,104 @@ output <-
 # close the progress bar and cluster
 close(pb)
 stopCluster(cluster)
+
+
+# 6 Routes passing through stressful junctions  ----
+# -----------------------------------------------------------------------------#
+# load network nodes
+nodes <- st_read(networkFile, layer = nodeLayer)
+
+# load routes
+routes <- st_read("./data/routes_networked.sqlite", layer = "survey")
+
+# read in  stressful junction file, and convert to sf object
+stressJct<- read.csv(stressJctFile) %>%
+  rename(WKT = WKT._stressJct) %>%
+  st_as_sf(., wkt = "WKT", crs = 4326) %>%
+  st_transform(st_crs(nodes)) 
+
+# join details of nearest node used by the survey participant
+for (i in 1:nrow(stressJct)) {
+  
+  # find the nodes used by the survey participant
+  respondent <- stressJct$Respondent.ID[i]
+  
+  respondent.node.ids <- routes %>%
+    filter(respondent.id == respondent) %>%
+    .$network_nodes %>%
+    str_split(", ") %>%
+    unlist() %>%
+    as.numeric() %>%
+    unique()
+  
+  respondent.nodes <- nodes %>%
+    filter(id %in% respondent.node.ids)
+  
+  # find the nearest respondent node to the junction
+  nearest.node.id <- 
+    respondent.nodes[st_nearest_feature(stressJct[i, ], respondent.nodes), ] %>%
+    .$id
+  
+  # build vector of routes using the node, starting with empty vector
+  routes.using.node <- c()
+  
+  # loop through the routes
+  for (j in 1:nrow(routes)) {
+    # extract vector of network nodes
+    network_nodes <- routes$network_nodes[j] %>%
+      str_split(", ") %>%
+      unlist() %>%
+      as.numeric()
+    
+    # if the route uses the node, add it to the vector
+    if (nearest.node.id %in% network_nodes) {
+      routes.using.node <- c(routes.using.node, routes$routeid[j])
+    }
+  }
+  
+  # add the nearest node vector to the stressful junctions dataframe
+  stressJct[i, "nearest_node"] <- nearest.node.id
+  stressJct[i, "route_ids"] <- toString(routes.using.node)
+  
+}
+
+# write output
+st_write(stressJct, "./data/stressJct.sqlite", delete_layer = TRUE)
+
+
+# 6 Favourite spot land types  ----
+# -----------------------------------------------------------------------------#
+# read in nodes (just used for CRS)
+nodes <- st_read(networkFile, layer = nodeLayer)
+
+# read in meshblocks
+MB <- read_zipped_GIS(zipfile = "./data/MB_2021_AUST_SHP_GDA2020.zip") %>%
+  st_transform(st_crs(nodes))
+
+# read in  favourite junction file
+favSpotBase <- read.csv(favSpotFile) %>%
+  # add a unique id for later joining
+  mutate(id = row_number())
+
+# convert to sf object and join meshblock land category
+favSpotSF <- favSpotBase %>%
+  # transform to sf in correct CRS
+  rename(WKT = WKT_FavSpot) %>%
+  st_as_sf(., wkt = "WKT", crs = 4326) %>%
+  st_transform(st_crs(nodes)) %>%
+  
+  # add meshblock land category to favourite spot file
+  st_join(MB %>% dplyr::select(land_type = MB_CAT21), join = st_intersects)
+
+# prepare output - original file with meshblock land category joined
+favSpotOutput <- favSpotBase %>%
+  left_join(favSpotSF %>% 
+              st_drop_geometry() %>%
+              dplyr::select(id, land_type), 
+            by = "id") %>%
+  dplyr::select(-id)
+
+# write output
+write.csv(favSpotOutput, "./data/favSpotLandType.csv", row.names = FALSE)
+
 
