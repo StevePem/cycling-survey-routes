@@ -2,6 +2,7 @@
 Processing routes from cycling survey
 
 `process.routes.R` does the following:
+
 1 Filter network links to exclude motorways, unless specifically tagged as' bike’ or ‘walk’, and filter network nodes to those connected by the cyclable links
 
 - Note that this would allow cycling on some links that aren’t actually tagged as ‘bike’ (which cyclists may in fact do!)
