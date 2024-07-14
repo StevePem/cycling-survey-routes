@@ -20,10 +20,11 @@
 # 7 Write output
 # 8 Produce check maps showing the survey and networked routes
 # 9 Find routes that pass through 'stressful junctions'
+# 10 Produce an expanded version of the output routes with network link details attached
 
 
 # set inputs
-networkFile <- "./data/network_melbourne_survey.sqlite"  # simplified network (note - all one way)
+networkFile <- "./data/network_weighted.sqlite"  # simplified network (note - all one way, contains LTS and other impedances)
 linkLayer <- "links"
 nodeLayer <- "nodes"
 surveyFile <- "./data/routedata.csv"
@@ -56,11 +57,12 @@ links <- st_read(networkFile, layer = linkLayer)
 nodes <- st_read(networkFile, layer = nodeLayer)
 
 # exclude all links that are motorways, unless they are specifically tagged as
-# cyclable or walkable
+# cyclable or walkable; exclude public transport
 all.cyclable.links <- links %>%
   filter(!highway %in% c("motorway", "motorway_link") | 
            (highway %in% c("motorway", "motorway_link") & 
-              (str_detect(modes, "walk") | str_detect(modes, "bike"))))
+              (str_detect(modes, "walk") | str_detect(modes, "bike")))) %>%
+  filter(!highway %in% c("train", "tram", "bus"))
 
 all.cyclable.nodes <- nodes %>%
   filter(id %in% all.cyclable.links$from_id | id %in% all.cyclable.links$to_id)
@@ -87,7 +89,8 @@ networkCrs <- st_crs(links)
 
 # graph from network
 graph <- graph_from_data_frame(cyclable.links %>%
-                                 mutate(weight = length),
+                                 mutate(weight = length) %>%
+                                 dplyr::select(from_id, to_id, weight, link_id),
                                directed = T,
                                vertices = cyclable.nodes)
 
@@ -547,7 +550,7 @@ for (i in 1:nrow(stressJct)) {
 st_write(stressJct, "./data/stressJct.sqlite", delete_layer = TRUE)
 
 
-# 6 Favourite spot land types  ----
+# 7 Favourite spot land types  ----
 # -----------------------------------------------------------------------------#
 # read in nodes (just used for CRS)
 nodes <- st_read(networkFile, layer = nodeLayer)
@@ -583,3 +586,160 @@ favSpotOutput <- favSpotBase %>%
 write.csv(favSpotOutput, "./data/favSpotLandType.csv", row.names = FALSE)
 
 
+# 8 Expanded networked survey routes  ----
+# -----------------------------------------------------------------------------#
+# table which is an expanded version of 'routes_networked', with one row
+# per link in each trip, and network details attached
+
+# read in routes_networked and network links
+routes_networked <- st_read("./data/routes_networked.sqlite", layer = "survey")
+links <- st_read(networkFile, layer = linkLayer)
+
+# expand routes_network by adding details listed below from links
+routes_networked_expanded <- 
+  expandRoutes(routes_networked %>%
+                 st_drop_geometry() %>%
+                 dplyr::select(routeid, respondent.id, destination, network_edges),
+               links %>% 
+                 st_drop_geometry() %>%
+                 dplyr::select(link_id, length, highway, cycleway, freespeed,
+                               surface, slope_pct, ndvi, ndvi_md, ndvi_75, ndvi_90,
+                               adt, lvl_traf_stress))
+
+
+# write output
+write.csv(routes_networked_expanded, "./data/routes_networked_expanded.csv",
+          row.names = FALSE)
+
+
+# 9 Equivalent shortest paths  ----
+# -----------------------------------------------------------------------------#
+## 9.1 Shortest paths ----
+## ------------------------------------#
+# read in routes_networked and network
+routes_networked <- st_read("./data/routes_networked.sqlite", layer = "survey") %>%
+  # remove geometry (which is the geometry drawn by the participant)
+  st_drop_geometry %>%
+  # keep required fields
+  dplyr::select(routeid, respondent.id, destination, network_nodes)
+
+# RUN SECTION 1, to read in network and create cyclable network graph ('graph')
+
+# setup for parallel processing - detect available cores and create cluster
+cores <- detectCores()
+cluster <- parallel::makeCluster(cores)
+doSNOW::registerDoSNOW(cluster)
+
+# report
+print(paste(Sys.time(), "| Finding shortest equivalent routes for", 
+            nrow(routes_networked), 
+            "survey paths; parallel processing with", cores, "cores"))
+
+# Set up progress reporting (see notes in section 2.3.3 for explanations)
+pb <- txtProgressBar(max = nrow(routes_networked), style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress = progress)
+
+# find shortest routes corresponding to survey paths
+shortest.routes <- 
+  foreach(i = 1:nrow(routes_networked),
+  # foreach(i = 1:10,
+          .packages = c("dplyr", "sf", "igraph", "stringr"), 
+          .combine = rbind,
+          .options.snow = opts) %dopar% {
+
+            # begin with row from routes_networked                
+            output.row <- routes_networked[i, ]
+            
+            # start and end nodes
+            network_nodes <- str_split(output.row$network_nodes, ", ") %>% 
+              unlist()
+            start.node <- network_nodes[1]
+            end.node <- network_nodes[length(network_nodes)]
+
+            # shortest route
+            shortest <- shortest_paths(graph, 
+                                       from = start.node,
+                                       to = end.node,
+                                       mode = "out",
+                                       output = "epath")
+            
+            # complete details if shortest route exists, otherwise NA
+            if (length(shortest$epath[[1]]) > 0) {
+              shortest.link.ids <- edge_attr(graph, "link_id", shortest$epath[[1]])
+              shortest.links <- cyclable.links %>%
+                filter(link_id %in% shortest.link.ids)
+              shortest.link.ids <- toString(shortest.link.ids)
+ 
+            } else {
+              shortest.link.ids <- NA
+
+            }
+            
+            # add shortest route details to output row
+            output.row <- c(output.row %>%
+                              dplyr::select(-network_nodes), 
+                            network_edges = shortest.link.ids)
+
+            # convert the output row (which has become a list) to a dataframe
+            output.row <- as.data.frame(output.row)
+            
+            # Return the output
+            return(output.row)
+            
+          }                                                    
+
+# end parallel processing
+close(pb)
+stopCluster(cluster)
+
+
+## 9.2 Shortest paths for display ----
+## ------------------------------------#
+# empty sf objects
+shortest.routes.paths <- st_sf(geometry = st_sfc(), 
+                                data.frame(id = numeric(), 
+                                           stringsAsFactors = FALSE),
+                                crs = st_crs(links))
+
+
+# create line for each route
+for (i in 1:nrow(shortest.routes)) {
+  link.ids <- shortest.routes$network_edges[i] %>%
+    strsplit(., ", ") %>%
+    unlist() %>%
+    as.numeric()
+  
+  route_links <- links %>% 
+    filter(link_id %in% link.ids) %>%
+    st_union()
+  
+  if (length(route_links) > 0) {
+    shortest.routes.paths <- bind_rows(shortest.routes.paths, 
+                                        st_sf(geometry = st_sfc(route_links), 
+                                              id = i,
+                                              routeid = shortest.routes$routeid[i]))
+  } 
+}
+
+# write output
+st_write(shortest.routes.paths, "./data/routes_networked.sqlite", 
+         layer = "shortest", delete_layer = TRUE)
+
+
+## 9.3 Expanded with network details ----
+## ------------------------------------#
+# expand routes_network by adding details listed below from links
+routes_shortest_expanded <- 
+  expandRoutes(shortest.routes %>%
+                 st_drop_geometry() %>%
+                 dplyr::select(routeid, respondent.id, destination, network_edges),
+               links %>% 
+                 st_drop_geometry() %>%
+                 dplyr::select(link_id, length, highway, cycleway, freespeed,
+                               surface, slope_pct, ndvi, ndvi_md, ndvi_75, ndvi_90,
+                               adt, lvl_traf_stress))
+
+# write output
+write.csv(routes_shortest_expanded, "./data/routes_shortest_expanded.csv",
+          row.names = FALSE)
